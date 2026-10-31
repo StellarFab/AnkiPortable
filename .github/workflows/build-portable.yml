@@ -233,7 +233,31 @@ jobs:
           "zip_sha=$zipSha"     >> $env:GITHUB_OUTPUT
         id: pack
 
-      # ---------- 4. 发布 ----------
+      # ---------- 4. 校验产物结构 ----------
+      - name: 校验产物
+        if: steps.resolve.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zip = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "dist") -Filter *.zip | Select-Object -First 1
+          $arc = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          $names = @($arc.Entries | ForEach-Object { $_.FullName })
+          $arc.Dispose()
+
+          foreach ($need in @("Anki.exe", "app_packages/", ".bat", ".vbs", "LICENSE.txt")) {
+            if (-not ($names | Where-Object { $_ -like "*$need*" })) { throw "产物里缺少 $need" }
+          }
+          Write-Host ("条目总数: " + $names.Count)
+          $top = $names | ForEach-Object { ($_ -split "/")[0] } | Sort-Object -Unique
+          Write-Host ("顶层: " + ($top -join " | "))
+          $sub = $names | Where-Object { $_ -like "*/*/*" } | ForEach-Object { ($_ -split "/")[1] } | Sort-Object -Unique
+          Write-Host ("二级: " + ($sub -join " | "))
+          $rootFiles = $names | Where-Object { ($_ -split "/").Count -eq 2 } | Sort-Object
+          Write-Host ("根目录文件: " + ($rootFiles -join " | "))
+
+      # ---------- 5. 发布 ----------
       - name: 发布 Release
         if: steps.resolve.outputs.build == 'true'
         shell: pwsh
