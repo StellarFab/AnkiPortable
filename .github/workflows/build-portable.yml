@@ -1,0 +1,266 @@
+name: 构建 Anki 便携版
+
+# 触发方式：
+#   1. 定时（每 6 小时）检查上游 ankitects/anki 是否发布了新的正式版
+#   2. 手动触发（可在 Actions 页面填版本号强制重建）
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "指定上游版本号（如 26.09.3）；留空 = 自动取上游最新正式版"
+        required: false
+        default: ""
+      force:
+        description: "强制重建（本仓库已存在同版本 release 时，先删除旧 release 和 tag）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: anki-portable-build
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  UPSTREAM: ankitects/anki
+
+jobs:
+  build:
+    name: 同步上游 → 生成便携包 → 发布 Release
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ---------- 1. 看上游有没有新版本 ----------
+      - name: 检测上游版本
+        id: resolve
+        shell: pwsh
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ver = "$env:VERSION_INPUT".Trim()
+          if ([string]::IsNullOrEmpty($ver)) {
+            $rel = gh api "repos/$env:UPSTREAM/releases/latest" | ConvertFrom-Json
+          } else {
+            $rel = gh api "repos/$env:UPSTREAM/releases/tags/$ver" | ConvertFrom-Json
+          }
+
+          $ver = $rel.tag_name
+          # 只接受正式版号（形如 26.09 或 26.09.3），beta / rc 一律跳过
+          if ($ver -notmatch '^\d{2}\.\d{2}(\.\d+)?$') {
+            throw "上游 tag 不是正式版，本次跳过 —— $ver"
+          }
+
+          $published = $rel.published_at
+          Write-Host "上游正式版: $ver  发布时间: $published"
+
+          $force = "$env:FORCE_INPUT" -eq "true"
+          gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$ver" --silent *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+
+          if ($exists -and -not $force) {
+            Write-Host "本仓库已有 $ver 的 release，本次无需构建。"
+            "build=false" >> $env:GITHUB_OUTPUT
+          } else {
+            if ($exists) {
+              Write-Host "强制重建：删除旧 release 与 tag $ver"
+              gh release delete $ver --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+            }
+            "build=true" >> $env:GITHUB_OUTPUT
+          }
+
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "published=$published" >> $env:GITHUB_OUTPUT
+
+      # ---------- 2. 下载官方安装包 ----------
+      - name: 下载官方 Windows 安装包
+        if: steps.resolve.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ steps.resolve.outputs.version }}"
+
+          New-Item -ItemType Directory -Force dl | Out-Null
+          gh release download $ver --repo $env:UPSTREAM --pattern "*win-x64.msi" --dir dl --clobber
+
+          $msi = Get-ChildItem dl -Filter *.msi | Select-Object -First 1
+          if (-not $msi) { throw "没有下载到 win-x64 安装包" }
+          Write-Host ("安装包: " + $msi.Name + "  " + [math]::Round($msi.Length / 1MB, 1) + " MB")
+
+          # 顺手把原始 msi 也作为小附件存档（200MB，可选；下面只保留哈希）
+          $hash = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash
+          Write-Host "官方安装包 SHA-256: $hash"
+
+      # ---------- 3. 解包 + 组装便携版 + 打 zip ----------
+      - name: 生成便携包
+        if: steps.resolve.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver       = "${{ steps.resolve.outputs.version }}"
+          $published = "${{ steps.resolve.outputs.published }}"
+          $dist      = Join-Path $env:GITHUB_WORKSPACE "dist"
+          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+          New-Item -ItemType Directory $dist | Out-Null
+
+          $msi = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "dl") -Filter *.msi | Select-Object -First 1
+          $msiSha = (Get-FileHash $msi.FullName -Algorithm SHA256).Hash
+          $sig    = Get-AuthenticodeSignature $msi.FullName
+          $signer = "无法读取证书"
+          if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.Subject }
+          Write-Host "MSI SHA-256: $msiSha"
+          Write-Host "签名状态: $($sig.Status)  $signer"
+
+          # --- 解包：msiexec 管理安装，等价于官方安装后复制出来的文件 ---
+          $tmp = Join-Path $env:RUNNER_TEMP "msi-out"
+          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+          New-Item -ItemType Directory $tmp -Force | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "msi.log"
+          $msiArgs = @("/a", $msi.FullName, "/qn", ("TARGETDIR=" + $tmp), "/l*v", $log)
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 | Out-Host }
+            throw ("msiexec 解包失败，退出码 " + $proc.ExitCode)
+          }
+
+          $exe = Get-ChildItem $tmp -Recurse -Filter Anki.exe -File | Select-Object -First 1
+          if (-not $exe) { throw "解包结果里找不到 Anki.exe" }
+          $src = $exe.DirectoryName
+          if (-not (Test-Path (Join-Path $src "app_packages"))) { throw "解包结果缺少 app_packages" }
+          Write-Host "程序目录: $src"
+
+          # 版本号归一化：26.09.3 → 26.9.3（dist-info 里的写法）
+          $norm = $ver
+          $distInfo = Get-ChildItem (Join-Path $src "app") -Filter "anki-*.dist-info" -Directory | Select-Object -First 1
+          if ($distInfo) { $norm = $distInfo.Name -replace "^anki-", "" -replace "\.dist-info$", "" }
+
+          # --- 组装 ---
+          $pkg  = "Anki-Portable-$ver"
+          $root = Join-Path $env:RUNNER_TEMP $pkg
+          if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+          New-Item -ItemType Directory $root -Force | Out-Null
+          New-Item -ItemType Directory (Join-Path $root "App")  -Force | Out-Null
+          New-Item -ItemType Directory (Join-Path $root "Data") -Force | Out-Null
+
+          robocopy $src (Join-Path $root "App") /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+          $rc = $LASTEXITCODE
+          if ($rc -ge 8) { throw ("复制程序文件失败，robocopy 退出码 " + $rc) }
+
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "skeleton\*") $root -Recurse -Force
+
+          $zipName = "$pkg-win-x64.zip"
+          $zip = Join-Path $dist $zipName
+
+          # --- 用模板生成 使用说明.txt（必须在压缩之前完成）---
+          $tmpl = Get-ChildItem $root -Filter "*.tmpl" -File | Select-Object -First 1
+          $text = Get-Content $tmpl.FullName -Raw -Encoding utf8
+          $text = $text.Replace("{{VERSION}}", $ver)
+          $text = $text.Replace("{{VERSION_NORM}}", $norm)
+          $text = $text.Replace("{{PUBLISH_DATE}}", ([datetime]$published).ToString("yyyy-MM-dd"))
+          $text = $text.Replace("{{RELEASE_URL}}", ("https://github.com/" + $env:UPSTREAM + "/releases/tag/" + $ver))
+          $text = $text.Replace("{{MSI_NAME}}", $msi.Name)
+          $text = $text.Replace("{{MSI_SIZE}}", $msi.Length.ToString("N0"))
+          $text = $text.Replace("{{MSI_SHA256}}", $msiSha)
+          $text = $text.Replace("{{SIG_STATUS}}", $sig.Status)
+          $text = $text.Replace("{{SIGNER}}", $signer)
+          $text = $text.Replace("{{ZIP_NAME}}", $zipName)
+          $text = $text.Replace("{{BUILD_DATE}}", (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm") + " UTC")
+          $text = $text.Replace("`r`n", "`n").Replace("`n", "`r`n")
+          Set-Content -Path (Join-Path $root $tmpl.BaseName) -Value $text -Encoding utf8BOM -NoNewline
+          Remove-Item $tmpl.FullName -Force
+
+          # --- 压缩（7z，比 Compress-Archive 快很多；保留 UTF-8 文件名）---
+          $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "7z.exe" }
+          Push-Location $env:RUNNER_TEMP
+          & $sevenZip a -tzip -mx=5 -mmt=on $zip $pkg | Out-Null
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) { throw "7z 压缩失败" }
+
+          $zipSize = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          $zipSha  = (Get-FileHash $zip -Algorithm SHA256).Hash
+          Write-Host "便携包: $zipName  $zipSize MB"
+          Write-Host "便携包 SHA-256: $zipSha"
+
+          # --- 生成 Release 说明 ---
+          $lines = @()
+          $lines += "# Anki 便携版 $ver（Windows x64）"
+          $lines += ""
+          $lines += "由官方安装包 ``$($msi.Name)`` 无损转换而来，程序本体与官方完全一致，仅把数据目录改为包内 ``Data\``。"
+          $lines += "本版本由 GitHub Actions 自动构建于 $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC。"
+          $lines += ""
+          $lines += "## 下载"
+          $lines += ""
+          $lines += "- ``$zipName``（$zipSize MB）"
+          $lines += "- SHA-256：``$zipSha``"
+          $lines += ""
+          $lines += "## 用法"
+          $lines += ""
+          $lines += "1. 解压到任意位置（路径含中文、空格都可以）"
+          $lines += "2. 双击 ``启动 Anki.bat``（或 ``启动 Anki（无黑框）.vbs``）"
+          $lines += "3. 数据全部保存在包内 ``Data\``，整个文件夹可随 U 盘带走"
+          $lines += ""
+          $lines += "## 来源与校验"
+          $lines += ""
+          $lines += "| 项目 | 值 |"
+          $lines += "| --- | --- |"
+          $lines += "| 上游发布页 | https://github.com/$env:UPSTREAM/releases/tag/$ver |"
+          $lines += "| 上游发布时间 | $published |"
+          $lines += "| 原始安装包 | ``$($msi.Name)``（$($msi.Length.ToString('N0')) 字节） |"
+          $lines += "| 安装包 SHA-256 | ``$msiSha`` |"
+          $lines += "| 数字签名 | $($sig.Status) — $signer |"
+          $lines += ""
+          $lines += "> 本包仅做解包与启动方式改写，未修改或重编译 Anki 任何代码。版权归 Anki Software LLC 所有，遵循 AGPL-3.0。"
+          Set-Content -Path (Join-Path $dist "notes.md") -Value ($lines -join "`r`n") -Encoding utf8BOM
+
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "zip_size=$zipSize" >> $env:GITHUB_OUTPUT
+          "zip_sha=$zipSha"     >> $env:GITHUB_OUTPUT
+        id: pack
+
+      # ---------- 4. 发布 ----------
+      - name: 发布 Release
+        if: steps.resolve.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver  = "${{ steps.resolve.outputs.version }}"
+          $zip  = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "dist") -Filter *.zip | Select-Object -First 1
+          $body = Join-Path $env:GITHUB_WORKSPACE "dist\notes.md"
+
+          $ghArgs = @(
+            "release", "create", $ver, $zip.FullName,
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--title", ("Anki 便携版 " + $ver + " (Windows x64)"),
+            "--notes-file", $body,
+            "--latest"
+          )
+          gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { throw "发布 Release 失败" }
+
+          Write-Host "已发布: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$ver"
+
+      - name: 构建摘要
+        if: always()
+        shell: pwsh
+        run: |
+          $s = @()
+          $s += "### Anki 便携版自动构建"
+          $s += ""
+          $s += "- 上游版本：``${{ steps.resolve.outputs.version }}``"
+          $s += "- 是否构建：``${{ steps.resolve.outputs.build }}``"
+          $s += "- 产物：``${{ steps.pack.outputs.zip_name }}``（${{ steps.pack.outputs.zip_size }} MB）"
+          $s += "- SHA-256：``${{ steps.pack.outputs.zip_sha }}``"
+          $s | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

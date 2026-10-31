@@ -1,0 +1,4 @@
+# 保留 Windows 脚本的原始字节（GBK 中文 + CRLF），禁止 git 做换行/编码转换
+*.bat   -text
+*.vbs   -text
+*.tmpl  -text
