@@ -62,12 +62,15 @@ jobs:
             throw "上游 tag 不是正式版，本次跳过 —— $ver"
           }
 
-          $published = $rel.published_at
+          $published = ([datetime]$rel.published_at).ToString("yyyy-MM-dd")
           Write-Host "上游正式版: $ver  发布时间: $published"
 
           $force = "$env:FORCE_INPUT" -eq "true"
-          gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$ver" --silent *> $null
-          $exists = ($LASTEXITCODE -eq 0)
+
+          # 用 release list 判断，而不是 releases/tags/{tag}——后者在不存在时会往
+          # stderr 写东西，配合 ErrorActionPreference=Stop 会直接把脚本打死
+          $existing = gh release list --repo $env:GITHUB_REPOSITORY --limit 200 --json tagName --jq ".[].tagName"
+          $exists = @($existing) -contains $ver
 
           if ($exists -and -not $force) {
             Write-Host "本仓库已有 $ver 的 release，本次无需构建。"
@@ -167,7 +170,7 @@ jobs:
           $text = Get-Content $tmpl.FullName -Raw -Encoding utf8
           $text = $text.Replace("{{VERSION}}", $ver)
           $text = $text.Replace("{{VERSION_NORM}}", $norm)
-          $text = $text.Replace("{{PUBLISH_DATE}}", ([datetime]$published).ToString("yyyy-MM-dd"))
+          $text = $text.Replace("{{PUBLISH_DATE}}", $published)
           $text = $text.Replace("{{RELEASE_URL}}", ("https://github.com/" + $env:UPSTREAM + "/releases/tag/" + $ver))
           $text = $text.Replace("{{MSI_NAME}}", $msi.Name)
           $text = $text.Replace("{{MSI_SIZE}}", $msi.Length.ToString("N0"))
